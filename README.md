@@ -10,7 +10,7 @@ Threshold or RL-based Auto-Scaling module
 
 ## Requirements
 ```
-Python 3.5.2+
+Python 3.6.5+
 ```
 
 Please install pip3 and requirements by using the command as below.

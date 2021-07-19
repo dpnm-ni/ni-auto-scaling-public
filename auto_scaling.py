@@ -17,21 +17,22 @@ import random
 
 # Parameters
 # OpenStack Parameters
-openstack_network_id = "" # Insert OpenStack Network ID to be used for creating SFC
+openstack_network_id = "43bccef5-e205-46ab-b7f4-08bf4c94e1ae" # Insert OpenStack Network ID to be used for creating SFC
 
 # <Important!!!!> parameters for Reinforcement Learning (DQN in this codes)
 learning_rate = 0.01            # Learning rate
 gamma         = 0.98            # Discount factor
-buffer_limit  = 5000            # Maximum Buffer size
-batch_size    = 32              # Batch size for mini-batch sampling
+buffer_limit  = 2500            # Maximum Buffer size
+batch_size    = 16              # Batch size for mini-batch sampling
 num_neurons = 128               # Number of neurons in each hidden layer
-epsilon = 0.08                  # epsilon value of e-greedy algorithm
-required_mem_size = 200         # Minimum number triggering sampling
+epsilon = 0.10                  # epsilon value of e-greedy algorithm
+required_mem_size = 20          # Minimum number triggering sampling
 print_interval = 20             # Number of iteration to print result during DQN
 
 # Global values
 sample_user_data = "#cloud-config\n password: %s\n chpasswd: { expire: False }\n ssh_pwauth: True\n manage_etc_hosts: true\n runcmd:\n - sysctl -w net.ipv4.ip_forward=1"
 scaler_list = []
+sfc_update_flag = True
 
 # get_monitoring_api(): get ni_monitoring_client api to interact with a monitoring module
 # Input: null
@@ -122,7 +123,8 @@ def get_node_info():
     ni_mon_api = get_monitoring_api()
     query = ni_mon_api.get_nodes()
 
-    response = [ node_info for node_info in query if node_info.type == "compute"]
+    response = [ node_info for node_info in query if node_info.type == "compute" and node_info.status == "enabled"]
+    response = [ node_info for node_info in response if not (node_info.name).startswith("NI-Compute-82-9")]
 
     return response
 
@@ -202,10 +204,22 @@ def get_sfc_by_name(sfc_name):
     return sfc_info
 
 
-# get_tier_status(vnf_info, sfc_info): get each tier status, each tier includes same type VNF instances
-# Input: vnf_info, sfc_info
-# Output: each tier status showing CPU utilization (%), Memory utilization (%), Number of disk operations, distribution, size)
-def get_tier_status(vnf_info, sfc_info):
+# get_soruce_client(sfc_name): get source client ID by using sfc_name
+# Input: sfc name
+# Output: source client info
+def get_source_client(sfc_name):
+
+    sfc_info = get_sfc_by_name(sfc_name)
+    sfcr_info = get_sfcr_by_id(sfc_info.sfcr_ids[0])
+    source_client = get_monitoring_api().get_vnf_instance(sfcr_info.source_client)
+
+    return source_client
+
+
+# get_tier_status(vnf_info, sfc_info, source_node): get each tier status, each tier includes same type VNF instances
+# Input: vnf_info, sfc_info, SFC's source_node
+# Output: each tier status showing resource utilizataion (CPU, Memory, Number of disk operations), size, distribution)
+def get_tier_status(vnf_info, sfc_info, source_node):
 
     ni_mon_api = get_monitoring_api()
     resource_type = ["cpu_usage___value___gauge",
@@ -260,7 +274,7 @@ def get_tier_status(vnf_info, sfc_info):
             tier_values.append(vnf_values) # CPU, Memory, Disk utilization of each tier
 
         # Define status
-        cpu, memory, disk = 0, 0, 0 # , network = 0, 0, 0, 0
+        cpu, memory, disk = 0, 0, 0
 
         # Calculate sum of each resource utilization of each tier
         for vnf_values in tier_values:
@@ -270,9 +284,17 @@ def get_tier_status(vnf_info, sfc_info):
 
         # Calculate average resource utilization to define state
         tier_size = len(tier_values)
-        tier_distribution = list(set(tier_distribution))
 
-        status = {"cpu" : cpu/tier_size, "memory" : memory/tier_size, "disk" : disk/tier_size, "distribution" : len(tier_distribution)/num_nodes, "size" : tier_size }
+        resource = 0.70*cpu/tier_size + 0.30* memory/tier_size #+ 0.001*disk/tier_size
+        tier_nodes = tier_distribution
+
+        dist_tier = 0
+
+        for node in tier_nodes:
+            num_hops = get_hops_in_topology(source_node, node)
+            dist_tier = dist_tier + num_hops/tier_size
+
+        status = { "resource" : resource, "size" : tier_size, "distribution" : dist_tier, "placement": tier_nodes }
 
         tier_status.append(status)
 
@@ -285,11 +307,9 @@ def get_tier_status(vnf_info, sfc_info):
 def get_state(tier_status):
         s = []
         for tier in tier_status:
-            s.append(tier["cpu"])
-            s.append(tier["memory"])
-            s.append(tier["disk"])
-            s.append(tier["distribution"])
+            s.append(tier["resource"])
             s.append(tier["size"])
+            s.append(tier["distribution"])
 
         return np.array(s)
 
@@ -297,22 +317,25 @@ def get_state(tier_status):
 # get_target_tier(tier_status, flag): get target tier to be applied auto-scaling action
 # Input: tier_status, flag (flag is a value to check scaling in or out, positive number is scaling out)
 # Output: tier index (if index is a negative number, no tier for scaling)
-def get_target_tier(tier_status, flag):
+def get_target_tier(tier_status, flag, random_flag):
 
     tier_scores = []
 
     for tier in tier_status:
-        resource_utilization = 0.9*tier["cpu"]+0.1*tier["memory"]
+        resource_utilization = tier["resource"]
         size = tier["size"]
+        dist_tier = tier["distribution"]
 
-        if flag > 0: # Add action # 분포도가 작은 놈을 (분포도 값이 큰놈 역수) 스케일 아웃
+        if flag > 0: # Add action # Scale-out
             scaling_mask = 0.0 if size > 4 else 1.0
+            dist_tier = 1.0 if dist_tier == 0 else dist_tier
             score = math.exp(resource_utilization)
-            score = scaling_mask*(1/tier["distribution"])*score
-        else: # Remove action # 분포도가 큰 놈을 스케일 인
+            score = scaling_mask*(1/dist_tier)*score
+        else: # Remove action # Scale-in
             scaling_mask = 0.0 if size < 2 else 1.0
+            dist_tier = 1.0 if dist_tier == 0 else dist_tier
             score = math.exp(-resource_utilization)
-            score = scaling_mask*tier["distribution"]*score
+            score = scaling_mask*dist_tier*score
 
         tier_scores.append(score)
 
@@ -322,7 +345,55 @@ def get_target_tier(tier_status, flag):
     if high_score == 0: # No tier for scaling
         return -1
 
-    return tier_scores.index(max(tier_scores))
+    if not random_flag:
+        # Target selection
+        return tier_scores.index(max(tier_scores))
+
+    else:
+        # Random selection
+        list_for_random = [score for score in tier_scores if score > 0 ]
+        return tier_scores.index(random.choice(list_for_random))
+
+
+# get_scaling_target(tier_status, flag): get target to to be applied auto-scaling action
+# Input: tier_status, source_node, flag (flag is a value to check scaling in or out, positive number is scaling out)
+# Output: target (node id in case of scale-out, vnf id in case of scale-in)
+def get_scaling_target(tier_status, source_node, flag, random_flag):
+
+    node_info = get_node_info()
+    tier_nodes = tier_status["placement"]
+    target_dist = []
+
+    if flag > 0: # scaling-out
+        for node in node_info:
+            if check_available_resource(node.id):
+                hop = get_hops_in_topology(source_node, node.id)
+                dist_tier = ((tier_status["distribution"] * tier_status["size"]) + hop) / (tier_status["size"] + 1)
+                target_dist.append(dist_tier)
+
+            else:
+                target_dist.append(10000)
+
+        if not random:
+            # Target node has the highest value
+            return node_info[target_dist.index(min(target_dist))].id
+        else:
+            # Random selection
+            return random.choice(node_info).id
+
+    else:
+        for node in tier_nodes:
+            hop = get_hops_in_topology(source_node, node)
+            dist_tier = ((tier_status["distribution"] * tier_status["size"]) - hop) / (tier_status["size"] - 1)
+            target_dist.append(dist_tier)
+
+        if not random_flag:
+            # Target instance has the highest value
+            return target_dist.index(min(target_dist))
+
+        else:
+            # Random selection
+            return random.randrange(0,len(target_dist))
 
 
 # deploy_vnf(vnf_spec): deploy VNF instance in OpenStack environment
@@ -348,34 +419,138 @@ def destroy_vnf(id):
 
 
 # measure_response_time(): send http requests from a source to a destination
-# Input: Null, instead, configure config.yaml file in advance
+# Input: scaler
 # Output: response time
-def measure_response_time():
+def measure_response_time(scaler):
 
     cnd_path = os.path.dirname(os.path.realpath(__file__))
     command = "./test_http_e2e.sh %s %s %s %s %s"
     command = "cd " + cnd_path + "/testing-tools && " + command
+    dst_ip = get_ip_from_id(scaler.get_monitor_dst_id())
 
     command = (command % (cfg["sla_monitoring"]["src"],
                           cfg["sla_monitoring"]["ssh_id"],
                           cfg["sla_monitoring"]["ssh_pw"],
                           cfg["sla_monitoring"]["num_requests"],
-                          cfg["sla_monitoring"]["dst"]))
+                          dst_ip))
     command = command + " | grep 'Time per request' | head -1 | awk '{print $4}'"
 
-    response = subprocess.check_output(command, shell=True).strip().decode("utf-8")
+    # Wait until web server is running
+    start_time = dt.datetime.now()
 
-    return float(response)
+    while True:
+        time.sleep(10)
 
-    #if response == '':
-    #    ni_nfvo_sfc_api = get_nfvo_sfc_api()
-    #    sfc_update_spec = ni_nfvo_client.SfcUpdateSpec() # SfcUpdateSpec | Sfc Update info.
-    #    sfc_info = get_sfc_by_name("dy-sfc")
-    #    sfc_update_spec.sfcr_ids = sfc_info.sfcr_ids
-    #    sfc_update_spec.vnf_instance_ids = initial_sfc_info
-    #    ni_nfvo_sfc_api.update_sfc(sfc_info.id, sfc_update_spec)
-    #    return -10000
-    #return float(response)
+        response = subprocess.check_output(command, shell=True).strip().decode("utf-8")
+
+        if response != "":
+            pprint("[%s] %s" % (scaler.get_scaling_name(), response))
+            return float(response)
+        elif (dt.datetime.now() - start_time).seconds > 60 or scaler.get_active_flag() == False:
+            scaler.set_active_flag(False)
+            return -1
+
+
+# lable_resource(flavor_id): check whether there are enough resource in nodes
+# Input: node_id
+# Output: True (enough), False (otherwise)
+def check_available_resource(node_id):
+
+    node_info = get_node_info()
+    selected_node = [ node for node in node_info if node.id == node_id ][-1]
+    flavor = get_monitoring_api().get_vnf_flavor(cfg["flavor"]["default"])
+
+    if selected_node.n_cores_free >= flavor.n_cores and selected_node.ram_free_mb >= flavor.ram_mb:
+        return True
+
+    return False
+
+
+# create_monitor(scaler): create instances to be source and destination to measure response time
+# Input: scaler
+# Output: True (success to create instances), False (otherwise)
+def create_monitor(scaler):
+    vnf_spec = get_nfvo_vnf_spec()
+    vnf_spec.image_id = cfg["image"]["sla_monitor"]
+    source_client = get_source_client(scaler.get_sfc_name())
+    target_node = source_client.node_id
+
+    # Repeat to try creating SLA monitors if fails
+    for k in range(0, 5):
+
+        # If enough resourcecs in a target node, create monitor
+        if check_available_resource(target_node):
+            vnf_spec.vnf_name = scaler.get_scaling_name() +  cfg["instance"]["prefix_splitter"] + "monitor-dst"
+            vnf_spec.node_name = target_node
+            dst_id = deploy_vnf(vnf_spec)
+
+            # Wait 1 minute untill creating SLA monitors
+            for i in range (0, 30):
+                time.sleep(2)
+
+                # Success to create SLA monitors
+                if check_active_instance(dst_id):
+                    scaler.set_monitor_src_id(cfg["sla_monitoring"]["id"])
+                    scaler.set_monitor_dst_id(dst_id)
+                    scaler.set_monitor_sfcr_id(create_monitor_classifier(scaler))
+
+                    sfc_info = get_sfc_by_name(scaler.get_sfc_name())
+                    sfc_info.sfcr_ids.append(scaler.get_monitor_sfcr_id())
+                    update_sfc(sfc_info)
+
+                    return True
+
+        # If not enough resources in a target node, select another one randomly
+        else:
+            target_node = random.choice(get_node_info()).id
+
+
+    # Fail to create SLA monitors
+    destory_vnf(dst_id)
+
+    return False
+
+
+# delete_monitor(scaler): delete SLA monitor instances
+# Input: scaler
+# Output: Null
+def delete_monitor(scaler):
+
+    sfc_info = get_sfc_by_name(scaler.get_sfc_name())
+    sfcr_id = scaler.get_monitor_sfcr_id()
+
+    if sfcr_id in sfc_info.sfcr_ids:
+        sfc_info.sfcr_ids.remove(sfcr_id)
+        update_sfc(sfc_info)
+
+        ni_nfvo_sfcr_api = get_nfvo_sfcr_api()
+        ni_nfvo_sfcr_api.del_sfcr(scaler.get_monitor_sfcr_id())
+
+        destroy_vnf(scaler.get_monitor_dst_id())
+
+
+# create_monitor_classifier(scaler): create flow classifier of traffic generator in the testbed
+# Input: scaler
+# Output: response
+def create_monitor_classifier(scaler):
+
+    ni_nfvo_sfcr_api = get_nfvo_sfcr_api()
+    name = scaler.get_scaling_name() + cfg["instance"]["prefix_splitter"] + "monitor"
+    source_client = scaler.get_monitor_src_id()
+    src_ip_prefix = get_ip_from_id(source_client) + "/32"
+    dst_ip_prefix = get_ip_from_id(scaler.get_monitor_dst_id()) + "/32"
+    sfcr_id = get_sfc_by_name(scaler.get_sfc_name()).sfcr_ids[-1]
+    nf_chain = get_sfcr_by_id(sfcr_id).nf_chain
+
+    sfcr_spec = ni_nfvo_client.SfcrSpec(name=name,
+                                 src_ip_prefix=src_ip_prefix,
+                                 dst_ip_prefix=dst_ip_prefix,
+                                 nf_chain=nf_chain,
+                                 source_client=source_client)
+
+    api_response = ni_nfvo_sfcr_api.add_sfcr(sfcr_spec)
+
+    return api_response
 
 
 # get_sfc_prefix(sfc_info): get sfc_prefix from sfc_info
@@ -390,7 +565,7 @@ def get_sfc_prefix(sfc_info):
 
 # update_sfc(sfc_info): Update SFC, main function to do auto-scaling
 # Input: updated sfc_info, which includes additional instances or removed instances
-# Output: none
+# Output: Boolean
 def update_sfc(sfc_info):
 
     ni_nfvo_sfc_api = get_nfvo_sfc_api()
@@ -399,7 +574,19 @@ def update_sfc(sfc_info):
     sfc_update_spec.sfcr_ids = sfc_info.sfcr_ids
     sfc_update_spec.vnf_instance_ids = sfc_info.vnf_instance_ids
 
-    ni_nfvo_sfc_api.update_sfc(sfc_info.id, sfc_update_spec)
+    for i in range(0, 15):
+        time.sleep(2)
+
+        global sfc_update_flag
+
+        if sfc_update_flag:
+            sfc_update_flag = False
+            ni_nfvo_sfc_api.update_sfc(sfc_info.id, sfc_update_spec)
+            sfc_update_flag = True
+
+            return True
+
+    return False
 
 
 # check_active_instance(id): Check an instance whether it's status is ACTIVE
@@ -420,71 +607,96 @@ def check_active_instance(id):
 # Output: none
 def threshold_scaling(scaler):
 
-    start_time = dt.datetime.now()
+    sfc_info = get_sfc_by_name(scaler.get_sfc_name())
 
     # Target SFC exist
-    if get_sfc_by_name(scaler.get_sfc_name()):
+    if sfc_info:
+
+        # Initial Processing
+        start_time = dt.datetime.now()
+        source_client = get_source_client(scaler.get_sfc_name())
+
+        flavors = get_all_flavors()
+        prefix = get_sfc_prefix(sfc_info)
+        instance_types = get_sfcr_by_id(sfc_info.sfcr_ids[-1]).nf_chain
+        del instance_types[0]
+
+        scaler.set_active_flag(create_monitor(scaler))
+
         while scaler.get_active_flag():
-            response_time = measure_response_time()
+            response_time = measure_response_time(scaler)
+
+            if response_time < 0:
+                break
 
             # Set sclaing_flag to show it is out or in or maintain
             if response_time > scaler.get_threshold_out():
-                print("Scaling-out!")
+                print("[%s] Scaling-out!" % (scaler.get_scaling_name()))
                 scaling_flag = 1
             elif response_time < scaler.get_threshold_in():
-                print("Scaling-in!")
+                print("[%s] Scaling-in!" % (scaler.get_scaling_name()))
                 scaling_flag = -1
             else:
-                print("Maintain!")
+                print("[%s] Maintain!" % (scaler.get_scaling_name()))
                 scaling_flag = 0
 
             # Scale-in or out
             if scaling_flag != 0:
                 sfc_info = get_sfc_by_name(scaler.get_sfc_name())
-                sfc_prefix = get_sfc_prefix(sfc_info)
-                sfc_vnfs = get_sfcr_by_id(sfc_info.sfcr_ids[-1]).nf_chain
-                del sfc_vnfs[0] # Flow classifier instance deletion
-                vnf_info = get_vnf_info(sfc_prefix, sfc_vnfs)
+                vnf_info = get_vnf_info(prefix, instance_types)
+                type_instances = get_instances_in_sfc(vnf_info, sfc_info)
 
-                tier_status = get_tier_status(vnf_info, sfc_info)
-                tier_index = get_target_tier(tier_status, scaling_flag)
+                # Select Type
+                type_status = get_type_status(type_instances, flavors)
+                type_index = get_target_type(type_status, source_client.node_id, scaling_flag, True)
 
-                if tier_index > -1:
-                    target_vnf_type = sfc_vnfs[tier_index]
-                    tier_vnf_ids = sfc_info.vnf_instance_ids[tier_index]
-                    num_tier_instances = len(tier_vnf_ids)
+                #if tier_index > -1:
+                if type_index > -1:
+                    scaling_target = get_scaling_target(type_status[type_index], source_client.node_id, scaling_flag, True)
+                    type_name = instance_types[type_index]
+                    instance_ids_in_type = [ instance.id for instance in type_instances[type_index]]
+                    num_instances = len(instance_ids_in_type)
 
                     # Scaling-out
                     if scaling_flag > 0:
                         # If possible to deploy new VNF instance
-                        if num_tier_instances < cfg["instance"]["max_number"]:
+                        if num_instances < cfg["instance"]["max_number"]:
                             vnf_spec = get_nfvo_vnf_spec()
-                            vnf_spec.vnf_name = sfc_prefix + target_vnf_type + cfg["instance"]["prefix_splitter"] + str(dt.datetime.now())
-                            vnf_spec.image_id = cfg["image"][target_vnf_type]
+                            vnf_spec.vnf_name = prefix + type_name + cfg["instance"]["prefix_splitter"] + dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            vnf_spec.image_id = cfg["image"][type_name]
+                            vnf_spec.node_name = scaling_target
                             instance_id = deploy_vnf(vnf_spec)
 
                             # Wait 1 minute until creating VNF instnace
-                            for i in range(0, 30):
+                            limit = 30
+                            for i in range(0, limit):
                                 time.sleep(2)
 
                                 # Success to create VNF instance
                                 if check_active_instance(instance_id):
-                                    tier_vnf_ids.append(instance_id)
-                                    sfc_info.vnf_instance_ids[tier_index] = tier_vnf_ids
+                                    instance_ids_in_type.append(instance_id)
+                                    sfc_info.vnf_instance_ids[type_index] = instance_ids_in_type
                                     update_sfc(sfc_info)
                                     break
+                                elif i == (limit-1):
+                                    destroy_vnf(instance_id)
+
 
                     # Scaling-in
                     elif scaling_flag < 0:
                         # If possible to remove VNF instance
-                        if num_tier_instances > cfg["instance"]["min_number"]:
-                            index = random.randrange(0, num_tier_instances)
+                        if num_instances > cfg["instance"]["min_number"]:
+                            index = scaling_target #random.randrange(0, num_tier_instances)
 
-                            instance_id = tier_vnf_ids[index]
-                            tier_vnf_ids.remove(instance_id)
-                            sfc_info.vnf_instance_ids[tier_index] = tier_vnf_ids
-                            update_sfc(sfc_info)
-                            destroy_vnf(instance_id)
+                            instance_id = instance_ids_in_type[index]
+                            instance_ids_in_type.remove(instance_id)
+                            sfc_info.vnf_instance_ids[type_index] = instance_ids_in_type
+                            update_flag = update_sfc(sfc_info)
+
+                            if update_flag:
+                                destroy_vnf(instance_id)
+                else:
+                    pprint("[%s] No scaling because of no target tier!" % (scaler.get_scaling_name()))
 
             current_time = dt.datetime.now()
 
@@ -496,10 +708,11 @@ def threshold_scaling(scaler):
 
     # Delete AutoScaler object
     if scaler in scaler_list:
+        delete_monitor(scaler)
         scaler_list.remove(scaler)
-        pprint("[Expire] Threshold Scaling")
+        pprint("[Expire: %s] Threshold Scaling" % (scaler.get_scaling_name()))
     else:
-        pprint("[Exit] Thresold Scaling")
+        pprint("[Exit: %s] Thresold Scaling" % (scaler.get_scaling_name()))
 
 
 # dqn-threshold(scaler): doing auto-scaling based on dqn
@@ -507,21 +720,30 @@ def threshold_scaling(scaler):
 # Output: none
 def dqn_scaling(scaler):
 
-    start_time = dt.datetime.now()
     sfc_info = get_sfc_by_name(scaler.get_sfc_name())
 
     # Target SFC exist
     if sfc_info:
-        sfc_prefix = get_sfc_prefix(sfc_info)
-        sfc_vnfs = get_sfcr_by_id(sfc_info.sfcr_ids[-1]).nf_chain
-        del sfc_vnfs[0] # Flow classifier instance deletion
 
-        node_info = get_node_info()
-        num_nodes = len(node_info)
+        # Initial Processing
+        start_time = dt.datetime.now()
+        source_client = get_source_client(scaler.get_sfc_name())
+        epsilon_value = epsilon
 
-        q = Qnet(len(sfc_vnfs), len(node_info), num_neurons)
-        q_target = Qnet(len(sfc_vnfs), len(node_info), num_neurons)
-        q_target.load_state_dict(q.state_dict()) # Q를 Target Q로 복사 (state_dict는 Model의 Weight 정보를 Dictionary 형태로 담고 있음)
+        flavors = get_all_flavors()
+        prefix = get_sfc_prefix(sfc_info)
+        instance_types = get_sfcr_by_id(sfc_info.sfcr_ids[-1]).nf_chain
+        del instance_types[0] # Flow classifier instance deletion
+
+        #node_info = get_node_info()
+
+        # Q-networks
+        num_states = 5 # Number of states
+        num_actions = 3 # Add, Maintain, Remove
+
+        q = Qnet(num_states, num_actions, num_neurons)
+        q_target = Qnet(num_states, num_actions, num_neurons)
+        q_target.load_state_dict(q.state_dict())
 
         optimizer = optim.Adam(q.parameters(), lr=learning_rate)
         n_epi = 0
@@ -529,126 +751,126 @@ def dqn_scaling(scaler):
         # If there is dataset, read it
         memory = ReplayBuffer(buffer_limit)
 
-        if scaler.has_dataset:
-            if os.path.isfile("data/"+scaler.scaling_name):
-                memory.readFromFile("data/"+scaler.scaling_name)
-            else:
-                f = open("data/"+scaler.scaling_name, 'w')
-                f.close()
-
         # Start scaling
+        scaler.set_active_flag(create_monitor(scaler))
+
         while scaler.get_active_flag():
-            epsilon = max(0.01, epsilon - 0.01*(n_epi/200)) #Linear annealing from 8% to 1%
+            epsilon_value = 0.1
 
             sfc_info = get_sfc_by_name(scaler.get_sfc_name())
-            vnf_info = get_vnf_info(sfc_prefix, sfc_vnfs)
-            tier_status = get_tier_status(vnf_info, sfc_info)
+            vnf_info = get_vnf_info(prefix, instance_types)
+
+            service_info = get_service_info(vnf_info, sfc_info, flavors)
 
             # Get state and select action
-            s = get_state(tier_status)
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+            s = state_pre_processor(service_info)
+
+            decision = q.sample_action(torch.from_numpy(s).float(), epsilon_value)
+
+            a = decision["action"]
+            decision_type = "Policy" if decision["type"] else "Random"
+
             done = False
 
             # Check whether it is out or in or maintain
-            if a < num_nodes:
-                print("Scaling-out!")
+            if a == 0:
+                print("[%s] Scaling-out! by %s" % (scaler.get_scaling_name(), decision_type))
                 scaling_flag = 1
-            elif a > num_nodes:
-                print("Scaling-in!")
+            elif a == 2:
+                print("[%s] Scaling-in! by %s" % (scaler.get_scaling_name(), decision_type))
                 scaling_flag = -1
             else:
-                print("Maintain!")
+                print("[%s] Maintain! by %s" % (scaler.get_scaling_name(), decision_type))
                 scaling_flag = 0
 
             # Scaling in or out
             if scaling_flag != 0:
-                tier_index = get_target_tier(tier_status, scaling_flag)
 
-                if tier_index > -1:
-                    target_node = node_info[a%num_nodes]
-                    target_vnf_type = sfc_vnfs[tier_index]
-                    tier_vnf_ids = sfc_info.vnf_instance_ids[tier_index]
-                    num_tier_instances = len(tier_vnf_ids)
+                # Scaling할 Type 선택
+                type_instances = get_instances_in_sfc(vnf_info, sfc_info)
+                type_status = get_type_status(type_instances, flavors)
+                type_index = get_target_type(type_status, source_client.node_id, scaling_flag, False)
+
+                if type_index > -1:
+                    scaling_target = get_scaling_target(type_status[type_index], source_client.node_id, scaling_flag, False)
+                    type_name = instance_types[type_index]
+                    instance_ids_in_type = [ instance.id for instance in type_instances[type_index]]
+                    num_instances = len(instance_ids_in_type)
 
                     # Scaling-out
                     if scaling_flag > 0:
                         # If possible to deploy new VNF instance
-                        if num_tier_instances < cfg["instance"]["max_number"]:
+                        if num_instances < cfg["instance"]["max_number"]:
                             vnf_spec = get_nfvo_vnf_spec()
-                            vnf_spec.vnf_name = sfc_prefix + target_vnf_type + cfg["instance"]["prefix_splitter"] + str(dt.datetime.now())
-                            vnf_spec.image_id = cfg["image"][target_vnf_type]
-                            vnf_spec.node_name = target_node.name
-
+                            vnf_spec.vnf_name = prefix + type_name + cfg["instance"]["prefix_splitter"] + dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            vnf_spec.image_id = cfg["image"][type_name]
+                            vnf_spec.node_name = scaling_target
                             instance_id = deploy_vnf(vnf_spec)
 
                             # Wait 1 minute until creating VNF instnace
-                            for i in range(0, 30):
+                            limit = 30
+                            for i in range(0, limit):
                                 time.sleep(2)
 
                                 # Success to create VNF instance
                                 if check_active_instance(instance_id):
-                                    tier_vnf_ids.append(instance_id)
-                                    sfc_info.vnf_instance_ids[tier_index] = tier_vnf_ids
+                                    #tier_vnf_ids.append(instance_id)
+                                    instance_ids_in_type.append(instance_id)
+                                    sfc_info.vnf_instance_ids[type_index] = instance_ids_in_type
                                     update_sfc(sfc_info)
                                     done = True
                                     break
+                                elif i == (limit-1):
+                                    destroy_vnf(instance_id)
 
                     # Scaling-in
                     elif scaling_flag < 0:
                         # If possible to remove VNF instance
-                        if num_tier_instances > cfg["instance"]["min_number"]:
-                            for i in range(0, 10):
-                                vnf_candidates = [ vnf_instance for vnf_instance in vnf_info if vnf_instance.node_id == target_node.name and vnf_instance.id in tier_vnf_ids]
-                                num_vnf_candidates = len(vnf_candidates)
+                        if num_instances > cfg["instance"]["min_number"]:
+                            index = scaling_target
 
-                                # Possible to remove VNF instance from a target node
-                                if num_vnf_candidates > 0:
-                                    index = random.randrange(0, num_vnf_candidates)
-                                    instance_id = tier_vnf_ids[index]
-                                    tier_vnf_ids.remove(instance_id)
-                                    sfc_info.vnf_instance_ids[tier_index] = tier_vnf_ids
-                                    update_sfc(sfc_info)
-                                    destroy_vnf(instance_id)
-                                    done = True
-                                    break
-                                # Re-select an action
-                                else:
-                                    a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+                            instance_id = instance_ids_in_type[index]
+                            instance_ids_in_type.remove(instance_id)
+                            sfc_info.vnf_instance_ids[type_index] = instance_ids_in_type
+                            update_flag = update_sfc(sfc_info)
 
-                                    if a < num_nodes:
-                                        a = a + num_nodes + 1
-                                        target_node = node_info[a%num_nodes]
+                            if update_flag:
+                                destroy_vnf(instance_id)
+                                done = True
 
                     # Maintain
                     else:
                         done = True
+                else:
+                    pprint("[%s] No scaling because of no target tier!" % (scaler.get_scaling_name()))
 
             # Prepare calculating rewards
+            time.sleep(5)
             sfc_info = get_sfc_by_name(scaler.get_sfc_name())
-            vnf_info = get_vnf_info(sfc_prefix, sfc_vnfs)
-            tier_status = get_tier_status(vnf_info, sfc_info)
+            vnf_info = get_vnf_info(prefix, instance_types)
 
-            s_prime = get_state(tier_status)
-            r = calculate_reward(vnf_info, node_info, sfc_info, scaler.get_slo())
+            service_info = get_service_info(vnf_info, sfc_info, flavors)
+            s_prime = state_pre_processor(service_info)
+
+            response_time = measure_response_time(scaler)
+
+            if response_time < 0:
+                break
+
+            type_instances = get_instances_in_sfc(vnf_info, sfc_info)
+            type_status = get_type_status(type_instances, flavors)
+
+            r = reward_calculator(service_info, response_time)
 
             done_mask = 1.0 if done else 0.0
             transition = (s,a,r,s_prime,done_mask)
             memory.put(transition)
 
-            # If has_dataset, save transition
-            if scaler.has_dataset:
-                if os.path.isfile("data/"+scaler.scaling_name):
-                    memory.writeToFile("data/"+scaler.scaling_name, transition)
-                else:
-                    f = open("data/"+scaler.scaling_name, 'w')
-                    f.close()
-                    memory.writeToFile("data/"+scaler.scaling_name, transition)
-
             if memory.size() > required_mem_size:
                 train(q, q_target, memory, optimizer, gamma, batch_size)
 
             if n_epi % print_interval==0 and n_epi != 0:
-                print("Target network updated!")
+                print("[%s] Target network updated!" % (scaler.get_scaling_name()))
                 q_target.load_state_dict(q.state_dict())
 
             current_time = dt.datetime.now()
@@ -658,95 +880,300 @@ def dqn_scaling(scaler):
 
             n_epi = n_epi+1
 
-            time.sleep(scaler.get_interval())
+            if n_epi > 1000:
+                scaler.set_active_flag(False)
 
+            time.sleep(scaler.get_interval())
 
     # Delete AutoScaler object
     if scaler in scaler_list:
+        delete_monitor(scaler)
         scaler_list.remove(scaler)
-        pprint("[Expire] DQN Scaling")
+        pprint("[Expire: %s] DQN Scaling" % (scaler.get_scaling_name()))
     else:
-        pprint("[Exit] DQN Scaling")
+        pprint("[Exit: %s] DQN Scaling" % (scaler.get_scaling_name()))
 
+    q.save_model("./"+scaler.get_scaling_name())
 
-# calculate_reward(vnf_info, node_info, sfc_info, slo): calcuate reward about action
-# Input: vnf_info, node_info, sfc_info, slo (get data to calculate reward)
+# calculate_reward(vnf_info, sfc_info, tier_status, slo, response_time): calcuate reward about action
+# Input: vnf_info, node_info, sfc_info, tier_status, slo, response_time (get data to calculate reward)
 # Output: calculated reward
-def calculate_reward(vnf_info, node_info, sfc_info, slo):
-    alpha = 1.2 # weight1
-    beta =  1 # weight2
+def calculate_reward(vnf_info, sfc_info, tier_status, slo, response_time):
+    alpha = 1.0 # weight1
+    beta =  1.2 # weight2
     sla_score = 0 # Check sla violation
-    dist_vnf = 1 # Distribution of VNF instances
-    dist_node = 1 # Distribution of used nodes (Node_used / Node_total)
+    dist_sfc = 0 # Distribution of SFC
 
     # Preprocessing: get vnf IDs placed in sfc
     sfc_vnf_ids = []
+    tier_size = len(sfc_info.vnf_instance_ids)
+
     for vnf_ids in sfc_info.vnf_instance_ids:
         sfc_vnf_ids = sfc_vnf_ids + vnf_ids
 
     # SLA violation check for reward
-    response_time = measure_response_time()
-
+    # VNF Usage (Total VNF / tierSize) and Dist_SFC
     sla_score = -response_time/slo
+    vnf_usage = len(sfc_vnf_ids)/tier_size
 
-    # Distribution of VNF instances,  Distribution of Node
-    vnf_total = len(sfc_vnf_ids)
-    vnf_deployed = [ vnf.node_id for vnf in vnf_info if vnf.id in sfc_vnf_ids ]
-    node_total = len(node_info)
-    node_used = 0
-
-    for node in node_info:
-        vnf_in_node = vnf_deployed.count(node.name) # the number of VNF instance in the node
-
-        # Exist at least one instance in the node
-        if vnf_in_node > 0:
-            node_used = node_used + 1
-            dist_vnf = dist_vnf * (vnf_in_node / vnf_total)
-    dist_node = node_used / node_total
+    for status in tier_status:
+        dist_sfc = dist_sfc + status["distribution"]/tier_size
 
     # Calculation reward
-    reward = sla_score + (alpha * dist_vnf * math.exp(-beta*dist_node))
+    reward = sla_score + (alpha * (1/vnf_usage) * math.exp(-beta*dist_sfc))
     return reward
 
-'''Unused now'''
-# set_flow_classifier(sfcr_name, sfc_ip_prefix, nf_chain, source_client): create flow classifier in the testbed
-# Input: flowclassifier name, flowclassifier ip prefix, list[list[each vnf id]], flowclassifier VM ID
-# Output: response
-def set_flow_classifier(sfcr_name, src_ip_prefix, nf_chain, source_client):
+def get_all_flavors():
 
-    ni_nfvo_sfcr_api = get_nfvo_sfcr_api()
+    ni_mon_api = get_monitoring_api()
+    query = ni_mon_api.get_vnf_flavors()
 
-    sfcr_spec = ni_nfvo_client.SfcrSpec(name=sfcr_name,
-                                 src_ip_prefix=src_ip_prefix,
-                                 nf_chain=nf_chain,
-                                 source_client=source_client)
+    return query
 
-    api_response = ni_nfvo_sfcr_api.add_sfcr(sfcr_spec)
+def get_instances_in_sfc(vnf_info, sfc_info):
+    instance_list = []
 
-    return api_response
+    for type_ids in sfc_info.vnf_instance_ids:
+        type_instances = [ instance for instance in vnf_info if instance.id in type_ids ]
+        instance_list.append(type_instances)
 
-'''Unused now'''
-# set_sfc(sfcr_id, sfc_name, sfc_path, vnfi_list): create sfc in the testbed
-# Input: flowclassifier name, sfc name, sfc path, vnfi_info
-# Output: response
-def set_sfc(sfcr_id, sfc_name, sfc_path, vnfi_info):
+    return instance_list
 
-    ni_nfvo_sfc_api = get_nfvo_sfc_api()
+def get_instance_info(instance, flavor):
+    ni_mon_api = get_monitoring_api()
+    resource_type = ["cpu_usage___value___gauge",
+                     "memory_free___value___gauge",
+                     "vda___disk_ops___read___derive",
+                     "vda___disk_ops___write___derive",
+                     "___if_dropped___tx___derive",
+                     "___if_dropped___rx___derive",
+                     "___if_packets___tx___derive",
+                     "___if_packets___rx___derive"]
 
-    vnf_instance_ids= []
+    info = { "id": instance.id, "cpu" : 0.0, "memory": 0.0, "disk": 0.0, "packets": 0.0, "drops": 0.0, "loss": 0.0, "location": "NULL" }
 
-    for vnfi in vnfi_info:
-        for vnf in sfc_path:
-            if sfc_path.index(vnf) == 0:
-                continue
+    # Get port names
+    for port in instance.ports:
+        if port.network_id == openstack_network_id:
+            network_port = port.port_name
+            break
 
-            if vnfi.name == vnf:
-                vnf_instance_ids.append([ vnfi.id ])
+    for resource in resource_type:
+        if "drop" in resource or "packets" in resource:
+            resource_type[resource_type.index(resource)] = network_port + resource
 
-    sfc_spec = ni_nfvo_client.SfcSpec(sfc_name=sfc_name,
-                                   sfcr_ids=[ sfcr_id ],
-                                   vnf_instance_ids=vnf_instance_ids)
+    # Set time-period to get resources
+    end_time = dt.datetime.now()
+    start_time = end_time - dt.timedelta(seconds = 10)
 
-    api_response = ni_nfvo_sfc_api.set_sfc(sfc_spec)
+    for resource in resource_type:
+        query = ni_mon_api.get_measurement(instance.id, resource, start_time, end_time)
+        value = 0
 
-    return api_response
+        for response in query:
+            value = value + response.measurement_value
+
+        value = value/len(query) if len(query) > 0 else 0
+
+        if resource.startswith("cpu"):
+            info["cpu"] = value
+        elif resource.startswith("memory"):
+            memory_ram_mb = flavor.ram_mb
+            memory_total = 1000000 * memory_ram_mb
+            info["memory"] = 100*(1-(value/memory_total)) if len(query) > 0 else 0
+        elif resource.startswith("vda"):
+            info["disk"] = info["disk"] + (value/(2*1000000))
+        elif "___if_dropped" in resource:
+            info["drops"] = info["drops"] + value
+        elif "___if_packets" in resource:
+            info["packets"] = info["packets"] + value
+
+    info["location"] = instance.node_id
+    info["loss"] = info["drops"]/info["packets"] if info["packets"] > 0 else 0
+
+    return info
+
+def get_type_status(type_instances, flavors):
+
+    type_status = []
+
+    # Set time-period to get resources
+    end_time = dt.datetime.now()
+    start_time = end_time - dt.timedelta(seconds = 10)
+
+    for type in type_instances:
+        type_info = { "cpu" : 0.0, "memory": 0.0, "disk": 0.0, "packets": 0.0, "drops": 0.0, "loss": 0.0, "location": [], "size": 0, "allocation": {"core": 0, "memory": 0} }
+        type_size = len(type)
+
+        type_info["size"] = type_size
+
+        for instance in type:
+            for flavor_info in flavors:
+                if flavor_info.id == instance.flavor_id:
+                    flavor = flavor_info
+                    type_info["allocation"]["core"] = flavor_info.n_cores
+                    type_info["allocation"]["memory"] = flavor_info.ram_mb
+                    break
+
+            instance_info = get_instance_info(instance, flavor)
+            type_info["cpu"] = type_info["cpu"] + instance_info["cpu"]/type_size
+            type_info["memory"] = type_info["memory"] + instance_info["memory"]/type_size
+            type_info["disk"] = type_info["disk"] + instance_info["disk"]/type_size
+            type_info["packets"] = type_info["packets"] + instance_info["packets"]/type_size
+            type_info["drops"] = type_info["drops"] + instance_info["drops"]/type_size
+            type_info["location"].append(instance_info["location"])
+
+        type_info["loss"] = type_info["drops"]/type_info["packets"] if type_info["packets"] > 0 else 0
+
+        type_status.append(type_info)
+
+    return type_status
+
+def get_hops_in_topology(src_node, dst_node):
+
+    nodes = [ "NI-Compute-82-81", "NI-Compute-82-82", "NI-Compute-82-48", "NI-Compute-82-49", "NI-Compute-82-51", "NI-Compute-82-55"]
+    hops = [[1, 2, 4, 4, 4, 5],
+            [2, 1, 4, 4, 4, 5],
+            [4, 4, 1, 2, 2, 5],
+            [4, 4, 2, 1, 2, 5],
+            [4, 4, 2, 2, 1, 5],
+            [5, 5, 5, 5, 5, 1]]
+
+    return hops[nodes.index(src_node)][nodes.index(dst_node)]
+
+
+def state_pre_processor(service_info):
+
+    state = []
+
+    # Create state
+    state.append(service_info["cpu"])
+    state.append(service_info["memory"])
+    state.append(service_info["disk"])
+    state.append(service_info["drops"]/service_info["packets"])
+    state.append(service_info["placement"])
+
+    return np.array(state)
+
+def get_service_info(vnf_info, sfc_info, flavors):
+    type_instances = get_instances_in_sfc(vnf_info, sfc_info)
+    type_status = get_type_status(type_instances, flavors)
+    service_info = { "cpu" : 0.0, "memory": 0.0, "disk": 0.0, "packets": 0.0, "drops": 0.0, "location": [], "placement": 0.0, "num_types": 0, "size": 0 }
+    size = len(type_status)
+
+    for status in type_status:
+        service_info["cpu"] = service_info["cpu"] + status["cpu"]/size
+        service_info["memory"] = service_info["memory"] + status["memory"]/size
+        service_info["disk"] = service_info["disk"] + status["disk"]/size
+        service_info["packets"] = service_info["packets"] + status["packets"]/size
+        service_info["drops"] = service_info["drops"] + status["drops"]/size
+        service_info["location"] = service_info["location"] + status["location"]
+        service_info["num_types"] = service_info["num_types"] + 1
+
+    # Placement
+    placement_value = 0
+    source_place = get_source_client(sfc_info.sfc_name).node_id
+    size = len(service_info["location"])
+
+    for location in service_info["location"]:
+        placement_value = placement_value + (get_hops_in_topology(source_place, location)/size)
+
+    service_info["size"] = size
+    service_info["placement"] = placement_value
+
+    return service_info
+
+def get_target_type(type_status, source_client, flag, random_flag): # decision model
+
+    type_scores = []
+    alpha = 0.85
+    beta = 0.15
+
+    for type in type_status:
+        resource_utilization = (alpha*(type["cpu"]/type["allocation"]["core"])) + (beta*(type["memory"]/type["allocation"]["memory"]))
+        dist = 0
+
+        for location in  type["location"]:
+            dist = dist + (get_hops_in_topology(source_client, location)/type["size"])
+
+        if flag > 0: # Add action
+            scaling_mask = 0.0 if type["size"] > 4 else 1.0
+            dist = 1.0 if dist == 0 else dist
+            score = (1/dist)*math.exp(resource_utilization)
+            score = scaling_mask*score
+        else: # Remove action
+            scaling_mask = 0.0 if type["size"] < 2 else 1.0
+            dist = 1.0 if dist == 0 else dist
+            score = dist*math.exp(-resource_utilization)
+            score = scaling_mask*score
+
+        type_scores.append(score)
+
+    # Target tier has the highest value
+    high_score = max(type_scores)
+
+    if high_score == 0: # No tier for scaling
+        return -1
+
+    if not random_flag:
+        # Target selection
+        return type_scores.index(max(type_scores))
+
+    else:
+        # Random selection
+        list_for_random = [score for score in type_scores if score > 0 ]
+        return type_scores.index(random.choice(list_for_random))
+
+def reward_calculator(service_info, response_time):
+    alpha = 1.0 # weight1
+    beta =  1.0 # weight2
+    gamma = 1.5 # weight3
+
+    response_time = response_time/1000.0
+    loss = service_info["drops"]/service_info["packets"] if service_info["packets"] != 0 else 1
+    inst_count = service_info["size"]/(service_info["num_types"]*5)
+
+    reward = -((alpha*math.log(1+response_time)+(beta*math.log(1+loss))+(gamma*math.log(1+inst_count))))
+
+    return reward
+
+def get_scaling_target(status, source_node, flag, random_flag): # decision model
+
+    node_info = get_node_info()
+    type_nodes = status["location"]
+    target_dist = []
+
+    # Total Dist
+    total_dist = 0
+    for location in status["location"]:
+        total_dist = total_dist + get_hops_in_topology(source_node, location)
+
+    # Scale-out
+    if flag > 0: # scaling-out
+        for node in node_info:
+            if check_available_resource(node.id):
+                dist = (total_dist + get_hops_in_topology(source_node, node.id))/(status["size"]+1)
+                target_dist.append(dist)
+            else:
+                target_dist.append(10000)
+
+        if not random_flag:
+            # Target node has the highest value
+            return node_info[target_dist.index(min(target_dist))].id
+        else:
+            # Random selection
+            return random.choice(node_info).id
+
+    # Scale-in
+    else:
+        for node in type_nodes:
+            dist = (total_dist - get_hops_in_topology(source_node, node))/(status["size"]-1)
+            target_dist.append(dist)
+
+        if not random_flag:
+            # Target instance has the highest value
+            return target_dist.index(min(target_dist))
+
+        else:
+            # Random selection
+            return random.randrange(0,len(target_dist))

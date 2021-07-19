@@ -10,6 +10,7 @@ instance:                                   # Information of new instance create
   min_number: 1                             # Minimum number of VNF instances allowed in each tier
 sla_monitoring:                             # To access traffic generator and create traffic
   src: <IP of traffic generator>            # IP of traffic generator (can be an instance in OpenStack)
+  id: aca0c954-27e9-42d8-8240-689948137f28  # ID of traffic generator (instance in OpenStack)
   ssh_id: <ssh_id of the traffic generator> # SSH ID of traffic generator
   ssh_pw: <ssh_pw of the traffic generator> # SSH PW of traffic generator
   num_requests: 100                         # Number of messages (This module generates HTTP messages)

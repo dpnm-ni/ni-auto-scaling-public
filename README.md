@@ -1,10 +1,10 @@
-# ni-auto-scaling-module-public
+# ni-auto-scaling-module
 NI-Auto-Scaling-Module applies auto-scaling to SFC in the OpenStack testbed.
 SFC consists of multi-tier VNF instances and this module applies auto-scaling by choosing a tier and performing an scaling action to the SFC.  
 
 ## Main Responsibilities
 Threshold or RL-based Auto-Scaling module
-- Provide APIs to do auto-scaling by threshold or Deep Q-networks (DQN)
+- Provide APIs to do auto-scaling by threshold or Deep Q-network (DQN)
 - Provide APIs to get auto-scaling processes running in environment
 - Provide API to delete an auto-scaling process running in environment
 
@@ -59,17 +59,18 @@ instance:                                   # Information of new instance create
   max_number: 5                             # Maximum number of VNF instances allowed in each tier
   min_number: 1                             # Minimum number of VNF instances allowed in each tier
 sla_monitoring:                             # To access traffic generator and create traffic
-  src: <IP of traffic generator>            # IP of traffic generator (can be an instance in OpenStack)
+  src: 141.223.82.43                        # IP of traffic generator (instance in OpenStack)
+  id: aca0c954-27e9-42d8-8240-689948137f28  # ID of traffic generator (instance in OpenStack)  
   ssh_id: <ssh_id of the traffic generator> # SSH ID of traffic generator
   ssh_pw: <ssh_pw of the traffic generator> # SSH PW of traffic generator
   num_requests: 100                         # Number of messages (This module generates HTTP messages)
-  dst: <IP of destination>                  # Destination of traffic
 image:                                      # Image IDs used by OpenStack
   firewall: <OpenStack Image ID>
   flowmonitor: <OpenStack Image ID>
   dpi: <OpenStack Image ID>
   ids: <OpenStack Image ID>
   proxy: <OpenStack Image ID>
+  sla_monitor: <OpenStack Image ID>
 flavor:                                     # Flavor ID used by OpenStack
   default:<OpenStack Flavor ID>
 ```

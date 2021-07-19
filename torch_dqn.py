@@ -2,6 +2,7 @@ import collections
 import random
 import numpy as np
 import csv
+from pprint import pprint
 
 # Import PyTorch library
 import torch
@@ -78,14 +79,15 @@ class ReplayBuffer():
 
 # Q-network
 class Qnet(nn.Module):
-    def __init__(self, num_tiers, num_nodes, num_neurons):
+    def __init__(self, num_inputs, num_outputs, num_neurons):
         super(Qnet, self).__init__()
-        self.num_input = 5*num_tiers
-        self.num_output = 2*num_nodes+1
+        self.num_inputs = num_inputs #3*num_tiers
+        self.num_outputs = num_outputs #3#2*num_nodes+1
+        self.num_neurons = num_neurons
 
-        self.fc1 = nn.Linear(self.num_input, num_neurons) # hidden layer 1
-        self.fc2 = nn.Linear(num_neurons, num_neurons) # hidden layer 2
-        self.fc3 = nn.Linear(num_neurons, self.num_output) # add 0~3 maintain 4 remove 5~8 maintain 2
+        self.fc1 = nn.Linear(self.num_inputs, self.num_neurons) # hidden layer 1
+        self.fc2 = nn.Linear(self.num_neurons, self.num_neurons) # hidden layer 2
+        self.fc3 = nn.Linear(self.num_neurons, self.num_outputs) # add 0~3 maintain 4 remove 5~8 maintain 2
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -97,12 +99,18 @@ class Qnet(nn.Module):
     def sample_action(self, obs, epsilon):
         out = self.forward(obs)
         coin = random.random()
+        policy = False
 
         # Regarding coin to select action randomly
         if coin < epsilon:
-            return random.randrange(0,self.num_output) # PARAMETER: RANDOM ACTION
+            policy = False
+            return { "action": random.randrange(0,self.num_outputs), "type" : policy } # PARAMETER: RANDOM ACTION
         else :
-            return out.argmax().item()
+            policy = True
+            return { "action": out.argmax().item(), "type": policy }
+
+    def save_model(self, path):
+        torch.save(self.state_dict(), path)
 
 
 # Update Target Q-network
